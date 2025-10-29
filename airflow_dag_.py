@@ -27,7 +27,6 @@ default_args = {
     tags=['sqs', 'api', 'boto3']
 )
 def sqs_monitor_dag():
-    # Initialize logger
     logger = LoggingMixin().log
 
     # Task to trigger the API and retrieve SQS URL
@@ -38,11 +37,16 @@ def sqs_monitor_dag():
             logger.info("Triggering API to get SQS URL...")
             response = requests.post(url)
             response.raise_for_status()
-            sqs_url = response.json()["sqs_url"]
+            sqs_url = response.json().get("sqs_url")
+            if not sqs_url:
+                raise ValueError(f"No 'sqs_url' in API response: {response.json()}")
             logger.info(f"SQS Queue URL: {sqs_url}")
             return sqs_url
         except requests.RequestException as e:
             logger.error(f"Error triggering API: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
             raise
 
     # Task to receive initial messages from the SQS queue
@@ -71,17 +75,10 @@ def sqs_monitor_dag():
         received_ids = set()
         try:
             sqs = boto3.client("sqs", region_name="us-east-1")
-            logger.info("Now monitoring queue to receive ALL messages...")
-            max_wait_time = 600
-            start_time = time.time()
+            logger.info("Monitoring queue indefinitely until all messages are collected...")
 
-            # Loop until all messages are collected or timeout occurs
             while len(collected_data) < expected_count:
-                if time.time() - start_time > max_wait_time:
-                    logger.warning("Timeout waiting for messages.")
-                    break
-
-                # Check number of messages available in the queue
+                # Get queue attributes
                 attrs = sqs.get_queue_attributes(
                     QueueUrl=sqs_url,
                     AttributeNames=[
@@ -91,18 +88,25 @@ def sqs_monitor_dag():
                     ],
                 )["Attributes"]
 
-                available = int(attrs["ApproximateNumberOfMessages"])
+                available = int(attrs.get("ApproximateNumberOfMessages", 0))
                 logger.info(f"Collected {len(collected_data)}/{expected_count} | Available: {available}")
 
-                # If messages are available, receive and process them
                 if available > 0:
                     response = sqs.receive_message(
                         QueueUrl=sqs_url,
                         MaxNumberOfMessages=10,
                         WaitTimeSeconds=5,
                         MessageAttributeNames=["All"],
+                        VisibilityTimeout=60
                     )
-                    for msg in response.get("Messages", []):
+                    messages = response.get("Messages", [])
+                    if not messages:
+                        logger.info("No messages returned despite availability. Waiting 5 seconds...")
+                        time.sleep(5)
+                        continue
+
+                    # Process and delete each message
+                    for msg in messages:
                         msg_id = msg["MessageId"]
                         if msg_id in received_ids:
                             continue
@@ -113,8 +117,17 @@ def sqs_monitor_dag():
                             collected_data[order_no] = word
                             received_ids.add(msg_id)
                             logger.info(f"Received order_no={order_no}, word={word}")
+
+                            # Delete message after processing
+                            sqs.delete_message(
+                                QueueUrl=sqs_url,
+                                ReceiptHandle=msg["ReceiptHandle"]
+                            )
+                            logger.info(f"Deleted message {msg_id} from queue")
+                        else:
+                            logger.warning(f"Message missing expected attributes: {msg}")
                 else:
-                    # Wait before polling again if no messages
+                    logger.info("No messages available, waiting 10 seconds...")
                     time.sleep(10)
 
             logger.info("All messages received successfully.")
@@ -138,7 +151,7 @@ def sqs_monitor_dag():
                     'platform': {'DataType': 'String', 'StringValue': platform}
                 }
             )
-            logger.info(f"Response: {response}")
+            logger.info(f"Submission response: {response}")
         except Exception as e:
             logger.error(f"Error sending solution: {e}")
             raise
@@ -150,19 +163,23 @@ def sqs_monitor_dag():
             logger.info("Final results:")
             for order_no in sorted(collected_data, key=lambda x: int(x)):
                 logger.info(f"{order_no}: {collected_data[order_no]}")
-            # Print final ordered phrase
             final_phrase = " ".join(collected_data[str(i)] for i in sorted(map(int, collected_data.keys())))
             print(f"Final ordered phrase: {final_phrase}")
         except Exception as e:
             logger.error(f"Error summarizing results: {e}")
             raise
 
-    # Define DAG task dependencies
+    # -----------------------------
+    # DAG Task Dependencies
+    # -----------------------------
     sqs_url = trigger_api()
-    receive_initial_messages(sqs_url)
+    initial_messages = receive_initial_messages(sqs_url)
     collected_data = monitor_sqs_queue(sqs_url)
-    send_solution("ega9cw", collected_data, "airflow")
-    summarize_results(collected_data)
+    send_task = send_solution("ega9cw", collected_data, "airflow")
+    summarize = summarize_results(collected_data)
+
+    # Set proper execution order
+    sqs_url >> initial_messages >> collected_data >> send_task >> summarize
 
 # Instantiate the DAG
 dag = sqs_monitor_dag()
